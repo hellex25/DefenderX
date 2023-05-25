@@ -1,0 +1,121 @@
+import os
+import tempfile
+import requests
+from flask import Flask, request, jsonify, render_template
+from urllib.parse import urlparse
+import time
+from flask_executor import Executor
+
+app = Flask(__name__)
+
+executor = Executor(app)
+
+API_KEY = os.getenv('API_KEY')
+if API_KEY is None:
+    raise ValueError("No API_KEY set for Flask application")
+
+def analyze_file(file_path):
+    url = 'https://www.virustotal.com/api/v3/files'
+    headers = {
+        'x-apikey': API_KEY
+    }
+
+    with open(file_path, 'rb') as f:
+        files = {
+            'file': f
+        }
+        while True:
+            response = requests.post(url, headers=headers, files=files)
+            
+            if response.status_code == 429:
+                print("Rate limit exceeded. Waiting for 60 seconds...")
+                time.sleep(60)  # wait for 60 seconds before retrying
+                continue
+            elif response.status_code != 200:
+                raise Exception(f'VirusTotal API error: {response.status_code}, Response: {response.content}')
+            
+            return response.json()
+
+def get_analysis_result(analysis_id):
+    url = f'https://www.virustotal.com/api/v3/analyses/{analysis_id}'
+    headers = {
+        'x-apikey': API_KEY
+    }
+
+    while True:
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code == 429:
+            print("Rate limit exceeded. Waiting for 60 seconds...")
+            time.sleep(60)  # wait for 60 seconds before retrying
+            continue
+        elif response.status_code != 200:
+            raise Exception(f'VirusTotal API error: {response.status_code}, Response: {response.content}')
+        
+        return response.json()
+
+def is_valid_url(url):
+    try:
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except ValueError:
+        return False
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    file = request.files.get('file')
+    url = request.form.get('url')
+
+    if not file and not url:
+        return jsonify({'error': 'No file or URL provided'}), 400
+
+    if url and not is_valid_url(url):
+        return jsonify({'error': 'Invalid URL provided'}), 400
+
+    with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+        if file:
+            file_size = len(file.read())
+            # VirusTotal API has a file size limit of 32MB for the free tier
+            if file_size > 32 * 1024 * 1024:
+                return jsonify({'error': 'File size exceeds the 32MB limit'}), 400
+            file.seek(0)  # reset file pointer to the start
+            file.save(temp_file)
+        else:
+            response = requests.get(str(url))
+            if response.status_code != 200:
+                return jsonify({'error': f'Unable to download file from URL: {url}'}), 400
+            temp_file.write(response.content)
+
+        temp_file.flush()
+
+        try:
+            submission_result = analyze_file(temp_file.name)
+            analysis_id = submission_result["data"]["id"]
+            return jsonify({'data': {'id': analysis_id}})
+
+        except Exception as e:
+            # distinguish between API error (500) and validation error (400)
+            if 'Invalid' in str(e):
+                return jsonify({'error': str(e)}), 400
+            else:
+                return jsonify({'error': str(e)}), 500
+
+        finally:
+            temp_file.close()
+            os.unlink(temp_file.name)
+
+@app.route('/analysis/<analysis_id>', methods=['GET'])
+def analysis(analysis_id):
+    try:
+        analysis_result = get_analysis_result(analysis_id)
+        return jsonify(analysis_result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
